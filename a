@@ -1,1 +1,177 @@
-s
+Понятно, настроим кластер Kafka 3.7.0 с KRaft на трех серверах с Oracle Linux Server 9.4. Вот пошаговая настройка с использованием абсолютных путей:
+
+### Предполагаемая конфигурация:
+- Сервер 1: 192.168.1.101 (broker + controller)
+- Сервер 2: 192.168.1.102 (broker + controller)
+- Сервер 3: 192.168.1.103 (broker + controller)
+
+### 1. Настройка server.properties для каждого узла
+
+**Для сервера 1 (/etc/kafka/server.properties):**
+```properties
+# KRaft настройки
+process.roles=broker,controller
+node.id=1
+
+# Настройки контроллера
+controller.quorum.voters=1@192.168.1.101:9093,2@192.168.1.102:9093,3@192.168.1.103:9093
+controller.listener.names=CONTROLLER
+
+# Настройки брокера
+broker.id=1
+listeners=PLAINTEXT://192.168.1.101:9092,CONTROLLER://192.168.1.101:9093
+advertised.listeners=PLAINTEXT://192.168.1.101:9092
+listener.security.protocol.map=CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT
+inter.broker.listener.name=PLAINTEXT
+
+# Директория логов
+log.dirs=/var/log/kafka
+
+# Другие настройки
+num.partitions=3
+default.replication.factor=3
+min.insync.replicas=2
+auto.create.topics.enable=false
+```
+
+**Для сервера 2 (/etc/kafka/server.properties):**
+```properties
+# KRaft настройки
+process.roles=broker,controller
+node.id=2
+
+# Настройки контроллера
+controller.quorum.voters=1@192.168.1.101:9093,2@192.168.1.102:9093,3@192.168.1.103:9093
+controller.listener.names=CONTROLLER
+
+# Настройки брокера
+broker.id=2
+listeners=PLAINTEXT://192.168.1.102:9092,CONTROLLER://192.168.1.102:9093
+advertised.listeners=PLAINTEXT://192.168.1.102:9092
+listener.security.protocol.map=CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT
+inter.broker.listener.name=PLAINTEXT
+
+# Директория логов
+log.dirs=/var/log/kafka
+
+# Другие настройки
+num.partitions=3
+default.replication.factor=3
+min.insync.replicas=2
+auto.create.topics.enable=false
+```
+
+**Для сервера 3 (/etc/kafka/server.properties):**
+```properties
+# KRaft настройки
+process.roles=broker,controller
+node.id=3
+
+# Настройки контроллера
+controller.quorum.voters=1@192.168.1.101:9093,2@192.168.1.102:9093,3@192.168.1.103:9093
+controller.listener.names=CONTROLLER
+
+# Настройки брокера
+broker.id=3
+listeners=PLAINTEXT://192.168.1.103:9092,CONTROLLER://192.168.1.103:9093
+advertised.listeners=PLAINTEXT://192.168.1.103:9092
+listener.security.protocol.map=CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT
+inter.broker.listener.name=PLAINTEXT
+
+# Директория логов
+log.dirs=/var/log/kafka
+
+# Другие настройки
+num.partitions=3
+default.replication.factor=3
+min.insync.replicas=2
+auto.create.topics.enable=false
+```
+
+### 2. Скрипт для установки Kafka и настройки KRaft на всех серверах
+
+Создайте скрипт setup-kafka.sh:
+
+```bash
+#!/bin/bash
+
+# Создание директорий для логов
+sudo mkdir -p /var/log/kafka
+sudo chown -R $(whoami):$(whoami) /var/log/kafka
+
+# Генерация UUID кластера (делается только на одном сервере)
+KAFKA_CLUSTER_ID=$(/opt/kafka/bin/kafka-storage.sh random-uuid)
+echo "Сгенерирован UUID кластера: $KAFKA_CLUSTER_ID"
+
+# Форматирование хранилища
+/opt/kafka/bin/kafka-storage.sh format -t $KAFKA_CLUSTER_ID -c /etc/kafka/server.properties
+
+# Настройка системной службы для Kafka
+sudo tee /etc/systemd/system/kafka.service > /dev/null << EOT
+[Unit]
+Description=Apache Kafka Server
+Documentation=http://kafka.apache.org/documentation.html
+Requires=network.target
+After=network.target
+
+[Service]
+Type=simple
+User=$(whoami)
+Environment="KAFKA_HEAP_OPTS=-Xmx4G -Xms1G"
+ExecStart=/opt/kafka/bin/kafka-server-start.sh /etc/kafka/server.properties
+ExecStop=/opt/kafka/bin/kafka-server-stop.sh
+Restart=on-abnormal
+
+[Install]
+WantedBy=multi-user.target
+EOT
+
+# Включение и запуск службы
+sudo systemctl daemon-reload
+sudo systemctl enable kafka
+sudo systemctl start kafka
+
+echo "Kafka успешно настроена и запущена!"
+```
+
+### 3. Порядок действий для развертывания кластера
+
+1. **На первом сервере (192.168.1.101)**:
+   ```bash
+   # Создать скрипт и запустить его
+   chmod +x setup-kafka.sh
+   ./setup-kafka.sh
+   
+   # Сохранить UUID кластера для других серверов
+   KAFKA_CLUSTER_ID=$(grep "Сгенерирован UUID кластера" -A 1 /var/log/setup-kafka.log | tail -1)
+   echo $KAFKA_CLUSTER_ID
+   ```
+
+2. **На втором и третьем серверах (192.168.1.102, 192.168.1.103)**:
+   ```bash
+   # Использовать тот же UUID, что и на первом сервере
+   KAFKA_CLUSTER_ID="полученный_uuid_с_первого_сервера"
+   
+   # Модифицировать скрипт, убрав генерацию UUID, и форматировать хранилище с полученным UUID
+   /opt/kafka/bin/kafka-storage.sh format -t $KAFKA_CLUSTER_ID -c /etc/kafka/server.properties
+   
+   # Запустить службу
+   sudo systemctl start kafka
+   ```
+
+### 4. Проверка работы кластера
+
+После запуска всех узлов проверьте статус кластера:
+
+```bash
+/opt/kafka/bin/kafka-metadata-quorum.sh --bootstrap-server 192.168.1.101:9092 describe --status
+```
+
+Убедитесь, что все контроллеры в кворуме и кластер работает нормально:
+
+```bash
+/opt/kafka/bin/kafka-topics.sh --bootstrap-server 192.168.1.101:9092 --create --topic test --partitions 3 --replication-factor 3
+/opt/kafka/bin/kafka-topics.sh --bootstrap-server 192.168.1.101:9092 --describe --topic test
+```
+
+Эта конфигурация предполагает установку каждого узла как комбинированного брокера и контроллера. Это обеспечивает высокую доступность, так как даже при отказе одного узла кластер продолжит работать.
