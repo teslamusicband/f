@@ -1,0 +1,375 @@
+#!/bin/bash
+
+# Скрипт установки Apache Kafka 3.9.0 в режиме KRaft (без ZooKeeper)
+# Автор: Claude
+# Дата: 13 мая 2025
+
+set -e  # Прерывать выполнение при ошибках
+
+# Цвета для вывода
+GREEN='\033[0;32m'
+YELLOW='\033[0;33m'
+RED='\033[0;31m'
+NC='\033[0m' # No Color
+
+# Функция для вывода сообщений
+log() {
+    echo -e "${GREEN}[INFO]${NC} $1"
+}
+
+error() {
+    echo -e "${RED}[ERROR]${NC} $1"
+    exit 1
+}
+
+warn() {
+    echo -e "${YELLOW}[WARNING]${NC} $1"
+}
+
+# Проверка необходимых утилит
+check_requirements() {
+    log "Проверка необходимых утилит..."
+    
+    for cmd in wget java tar; do
+        if ! command -v $cmd &> /dev/null; then
+            error "Команда $cmd не найдена. Пожалуйста, установите необходимые пакеты."
+        fi
+    done
+    
+    # Проверка версии Java
+    java_version=$(java -version 2>&1 | head -n 1 | awk -F '"' '{print $2}')
+    major_version=$(echo $java_version | cut -d'.' -f1)
+    
+    if [ "$major_version" -lt "11" ]; then
+        error "Для Kafka 3.9.0 требуется Java 11 или выше. Текущая версия: $java_version"
+    fi
+    
+    log "Все требования выполнены."
+}
+
+# Установка переменных окружения
+setup_environment() {
+    log "Настройка переменных окружения..."
+    
+    # Базовая директория установки
+    KAFKA_BASE_DIR=${KAFKA_BASE_DIR:-"/opt"}
+    
+    # Версия Kafka
+    KAFKA_VERSION="3.9.0"
+    
+    # URL для загрузки
+    KAFKA_URL="https://downloads.apache.org/kafka/${KAFKA_VERSION}/kafka_2.13-${KAFKA_VERSION}.tgz"
+    
+    # Директория установки Kafka
+    KAFKA_HOME="${KAFKA_BASE_DIR}/kafka_2.13-${KAFKA_VERSION}"
+    
+    # Режим Kraft
+    KRAFT_CLUSTER_ID=""
+    
+    # Создание пользователя kafka, если он не существует
+    if ! id -u kafka &>/dev/null; then
+        log "Создание пользователя kafka..."
+        useradd -r -d ${KAFKA_HOME} -s /bin/false kafka || error "Не удалось создать пользователя kafka"
+    fi
+    
+    # Экспорт переменных для использования в других функциях
+    export KAFKA_VERSION KAFKA_URL KAFKA_HOME KAFKA_BASE_DIR
+}
+
+# Загрузка и установка Kafka
+download_and_install() {
+    log "Загрузка Apache Kafka ${KAFKA_VERSION}..."
+    
+    # Создание временной директории
+    TMP_DIR=$(mktemp -d)
+    cd ${TMP_DIR}
+    
+    # Загрузка архива
+    wget ${KAFKA_URL} -O kafka.tgz || error "Не удалось загрузить Kafka"
+    
+    log "Распаковка архива..."
+    tar -xzf kafka.tgz -C ${KAFKA_BASE_DIR} || error "Не удалось распаковать архив"
+    
+    # Создание символической ссылки
+    ln -sf ${KAFKA_HOME} ${KAFKA_BASE_DIR}/kafka
+    
+    # Установка прав доступа
+    chown -R kafka:kafka ${KAFKA_HOME}
+    
+    # Очистка временных файлов
+    cd && rm -rf ${TMP_DIR}
+    
+    log "Apache Kafka успешно установлена в ${KAFKA_HOME}"
+}
+
+# Генерация ID кластера для KRaft
+generate_cluster_id() {
+    log "Генерация ID кластера KRaft..."
+    
+    # Генерация уникального ID кластера
+    KRAFT_CLUSTER_ID=$(${KAFKA_HOME}/bin/kafka-storage.sh random-uuid)
+    export KRAFT_CLUSTER_ID
+    
+    log "Сгенерирован ID кластера KRaft: ${KRAFT_CLUSTER_ID}"
+}
+
+# Базовая настройка Kafka в режиме KRaft
+configure_kafka_kraft() {
+    log "Настройка Apache Kafka в режиме KRaft..."
+    
+    # Создание директории для логов Kafka
+    KAFKA_LOGS_DIR=${KAFKA_LOGS_DIR:-"/var/log/kafka"}
+    mkdir -p ${KAFKA_LOGS_DIR}
+    chown -R kafka:kafka ${KAFKA_LOGS_DIR}
+    
+    # Создание директории для данных
+    KAFKA_DATA_DIR=${KAFKA_DATA_DIR:-"/var/lib/kafka/data"}
+    mkdir -p ${KAFKA_DATA_DIR}
+    chown -R kafka:kafka ${KAFKA_DATA_DIR}
+    
+    # Создание файла конфигурации для режима KRaft
+    KRAFT_CONFIG="${KAFKA_HOME}/config/kraft/server.properties"
+    
+    # Создание директории для KRaft конфигурации
+    mkdir -p ${KAFKA_HOME}/config/kraft
+    
+    # Создаем файл конфигурации KRaft
+    cat > ${KRAFT_CONFIG} << EOF
+# Базовые настройки брокера
+node.id=1
+process.roles=broker,controller
+listeners=PLAINTEXT://:9092,CONTROLLER://:9093
+controller.quorum.voters=1@localhost:9093
+controller.listener.names=CONTROLLER
+
+# Настройки директорий
+log.dirs=${KAFKA_DATA_DIR}
+
+# Настройки по умолчанию для топиков
+num.partitions=3
+default.replication.factor=1
+min.insync.replicas=1
+auto.create.topics.enable=true
+
+# Настройки объема данных
+log.retention.hours=168
+log.segment.bytes=1073741824
+log.retention.check.interval.ms=300000
+
+# Настройки сетевого взаимодействия
+num.network.threads=3
+num.io.threads=8
+socket.send.buffer.bytes=102400
+socket.receive.buffer.bytes=102400
+socket.request.max.bytes=104857600
+max.connections.per.ip=1000
+advertised.listeners=PLAINTEXT://localhost:9092
+EOF
+    
+    chown kafka:kafka ${KRAFT_CONFIG}
+    
+    log "Базовая настройка KRaft завершена. Конфигурация сохранена в ${KRAFT_CONFIG}"
+}
+
+# Форматирование хранилища для KRaft
+format_storage() {
+    log "Форматирование хранилища для KRaft..."
+    
+    # Определение конфигурационного файла
+    KRAFT_CONFIG="${KAFKA_HOME}/config/kraft/server.properties"
+    
+    # Форматирование хранилища с использованием ID кластера
+    su -s /bin/bash kafka -c "${KAFKA_HOME}/bin/kafka-storage.sh format -t ${KRAFT_CLUSTER_ID} -c ${KRAFT_CONFIG}"
+    
+    log "Хранилище успешно отформатировано"
+}
+
+# Создание systemd сервиса для Kafka в режиме KRaft
+create_systemd_service() {
+    log "Создание systemd сервиса для Kafka в режиме KRaft..."
+    
+    # Определение конфигурационного файла
+    KRAFT_CONFIG="${KAFKA_HOME}/config/kraft/server.properties"
+    
+    # Создание сервиса для Kafka
+    cat > /etc/systemd/system/kafka-kraft.service << EOF
+[Unit]
+Description=Apache Kafka Server (KRaft mode)
+Documentation=https://kafka.apache.org/documentation.html
+Requires=network.target
+After=network.target
+
+[Service]
+Type=simple
+User=kafka
+Group=kafka
+Environment=KAFKA_HEAP_OPTS="-Xmx1G -Xms1G"
+Environment=KAFKA_JVM_PERFORMANCE_OPTS="-XX:+UseG1GC -XX:MaxGCPauseMillis=20 -XX:InitiatingHeapOccupancyPercent=35 -XX:+ExplicitGCInvokesConcurrent -XX:MaxInlineLevel=15 -Djava.awt.headless=true"
+Environment=KAFKA_CLUSTER_ID=${KRAFT_CLUSTER_ID}
+ExecStart=${KAFKA_BASE_DIR}/kafka/bin/kafka-server-start.sh ${KRAFT_CONFIG}
+ExecStop=${KAFKA_BASE_DIR}/kafka/bin/kafka-server-stop.sh
+Restart=on-failure
+RestartSec=10
+StartLimitInterval=30
+StartLimitBurst=3
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+    # Перезагрузка конфигурации systemd
+    systemctl daemon-reload
+    
+    log "Systemd сервис создан"
+}
+
+# Запуск сервиса
+start_service() {
+    log "Запуск сервиса Kafka в режиме KRaft..."
+    
+    # Включение автозапуска
+    systemctl enable kafka-kraft.service
+    
+    # Запуск сервиса
+    systemctl start kafka-kraft.service
+    sleep 20  # Даем Kafka время на запуск
+    
+    log "Проверка статуса сервиса..."
+    systemctl status kafka-kraft.service --no-pager
+}
+
+# Проверка установки
+verify_installation() {
+    log "Проверка установки Kafka в режиме KRaft..."
+    
+    # Ожидание полного запуска сервиса
+    sleep 20
+    
+    # Создание тестового топика
+    ${KAFKA_BASE_DIR}/kafka/bin/kafka-topics.sh --create \
+        --bootstrap-server localhost:9092 \
+        --replication-factor 1 \
+        --partitions 1 \
+        --topic test-kraft
+    
+    # Вывод списка топиков
+    ${KAFKA_BASE_DIR}/kafka/bin/kafka-topics.sh --list \
+        --bootstrap-server localhost:9092
+    
+    log "Проверка установки завершена успешно!"
+    log "Kafka в режиме KRaft работает и готова к использованию."
+}
+
+# Функция очистки при ошибке
+cleanup() {
+    warn "Произошла ошибка. Очистка..."
+    
+    # Остановка сервиса
+    systemctl stop kafka-kraft.service 2>/dev/null || true
+    
+    # Отключение автозапуска
+    systemctl disable kafka-kraft.service 2>/dev/null || true
+    
+    # Удаление файла systemd
+    rm -f /etc/systemd/system/kafka-kraft.service
+    systemctl daemon-reload
+    
+    error "Установка прервана из-за ошибки"
+}
+
+# Функция для показа справки
+show_help() {
+    echo "Использование: $0 [ОПЦИИ]"
+    echo
+    echo "Скрипт для установки Apache Kafka 3.9.0 в режиме KRaft (без ZooKeeper)"
+    echo
+    echo "Опции:"
+    echo "  --help                Показать эту справку"
+    echo "  --no-start            Установить, но не запускать сервис"
+    echo "  --data-dir DIR        Указать директорию для данных (по умолчанию: /var/lib/kafka/data)"
+    echo "  --logs-dir DIR        Указать директорию для логов (по умолчанию: /var/log/kafka)"
+    echo "  --install-dir DIR     Указать базовую директорию установки (по умолчанию: /opt)"
+    echo "  --cluster-id ID       Указать свой ID кластера (по умолчанию: генерируется автоматически)"
+    echo
+    exit 0
+}
+
+# Основная функция
+main() {
+    NO_START=false
+    
+    # Обработка параметров командной строки
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --help)
+                show_help
+                ;;
+            --no-start)
+                NO_START=true
+                shift
+                ;;
+            --data-dir)
+                export KAFKA_DATA_DIR="$2"
+                shift 2
+                ;;
+            --logs-dir)
+                export KAFKA_LOGS_DIR="$2"
+                shift 2
+                ;;
+            --install-dir)
+                export KAFKA_BASE_DIR="$2"
+                shift 2
+                ;;
+            --cluster-id)
+                export KRAFT_CLUSTER_ID="$2"
+                shift 2
+                ;;
+            *)
+                warn "Неизвестный параметр: $1"
+                shift
+                ;;
+        esac
+    done
+    
+    # Проверка прав root
+    if [ "$(id -u)" -ne 0 ]; then
+        error "Этот скрипт должен быть запущен с правами root"
+    fi
+    
+    # Установка обработчика ошибок
+    trap cleanup ERR
+    
+    log "Начало установки Apache Kafka ${KAFKA_VERSION} в режиме KRaft..."
+    
+    # Выполнение всех шагов установки
+    check_requirements
+    setup_environment
+    download_and_install
+    
+    # Если ID кластера не указан, генерируем его
+    if [ -z "${KRAFT_CLUSTER_ID}" ]; then
+        generate_cluster_id
+    else
+        log "Используется предоставленный ID кластера: ${KRAFT_CLUSTER_ID}"
+    fi
+    
+    configure_kafka_kraft
+    format_storage
+    create_systemd_service
+    
+    if [ "$NO_START" = false ]; then
+        start_service
+        verify_installation
+    else
+        log "Сервис не был запущен (--no-start). Для запуска выполните:"
+        echo "  sudo systemctl start kafka-kraft.service"
+    fi
+    
+    log "Установка Apache Kafka ${KAFKA_VERSION} в режиме KRaft успешно завершена!"
+    log "Конфигурационный файл: ${KAFKA_HOME}/config/kraft/server.properties"
+    log "ID кластера KRaft: ${KRAFT_CLUSTER_ID}"
+    log "Сохраните ID кластера, он потребуется при добавлении новых узлов в кластер."
+}
+
+# Запуск скрипта
+main "$@"
