@@ -1,0 +1,176 @@
+# Настройка ZFS для Kafka на нескольких дисках
+
+## Часть 1: Настройка ZFS на 10 дисках
+
+### 1. Установка ZFS
+```bash
+# Для Ubuntu/Debian
+sudo apt update
+sudo apt install -y zfsutils-linux
+
+# Для CentOS/RHEL
+sudo dnf install -y epel-release
+sudo dnf install -y zfs
+sudo modprobe zfs
+```
+
+### 2. Проверка доступных дисков
+```bash
+lsblk
+# Убедитесь, что видны диски от sdb до sdk
+```
+
+### 3. Создание пула ZFS RAIDZ2
+RAIDZ2 обеспечивает хорошую производительность и устойчивость к отказу до двух дисков одновременно.
+
+```bash
+# Создаем пул с именем kafkapool в конфигурации RAIDZ2
+sudo zpool create kafkapool raidz2 /dev/sdb /dev/sdc /dev/sdd /dev/sde /dev/sdf /dev/sdg /dev/sdh /dev/sdi /dev/sdj /dev/sdk
+```
+
+### 4. Настройка параметров пула ZFS для оптимальной работы с Kafka
+```bash
+# Установка параметров для пула
+sudo zfs set atime=off kafkapool      # Отключаем запись времени доступа для повышения производительности
+sudo zfs set compression=lz4 kafkapool # Включаем компрессию LZ4 (быстрая и эффективная)
+sudo zfs set xattr=sa kafkapool        # Оптимизация для метаданных
+sudo zfs set recordsize=128K kafkapool # Оптимальный размер записи для Kafka
+sudo zfs set primarycache=metadata kafkapool # Кешировать только метаданные
+sudo zfs set logbias=throughput kafkapool    # Оптимизация для пропускной способности
+```
+
+### 5. Создание файловой системы для Kafka в пуле ZFS
+```bash
+# Создание файловой системы для данных Kafka
+sudo zfs create kafkapool/kafka_data
+```
+
+### 6. Настройка прав доступа для директории Kafka
+```bash
+# Предполагая, что Kafka работает от пользователя kafka
+sudo mkdir -p /kafkapool/kafka_data/logs
+sudo chown -R kafka:kafka /kafkapool/kafka_data
+sudo chmod -R 750 /kafkapool/kafka_data
+```
+
+## Часть 2: Перенос Kafka на ZFS
+
+### 1. Остановка Kafka сервиса
+```bash
+# Если Kafka управляется через systemd
+sudo systemctl stop kafka
+
+# Если используется скрипт запуска
+sudo /opt/kafka/bin/kafka-server-stop.sh
+```
+
+### 2. Создание новой директории для логов Kafka
+```bash
+sudo mkdir -p /kafkapool/kafka_data/logs
+sudo chown -R kafka:kafka /kafkapool/kafka_data/logs
+```
+
+### 3. Копирование существующих данных Kafka
+```bash
+# Копирование данных из текущей директории логов
+sudo cp -a /opt/kafka_log/* /kafkapool/kafka_data/logs/
+sudo chown -R kafka:kafka /kafkapool/kafka_data/logs
+```
+
+### 4. Изменение конфигурации Kafka
+```bash
+# Редактирование server.properties
+sudo vi /opt/kafka/config/kraft/server.properties
+
+# Изменение или добавление параметра log.dirs
+# log.dirs=/kafkapool/kafka_data/logs
+```
+
+### 5. Запуск Kafka с новой конфигурацией
+```bash
+# Если Kafka управляется через systemd
+sudo systemctl start kafka
+
+# Если используется скрипт запуска
+sudo /opt/kafka/bin/kafka-server-start.sh -daemon /opt/kafka/config/kraft/server.properties
+```
+
+### 6. Проверка работоспособности Kafka
+```bash
+# Проверка статуса Kafka
+sudo systemctl status kafka
+
+# Проверка логов на наличие ошибок
+sudo tail -f /opt/kafka/logs/server.log
+```
+
+### 7. Проверка ZFS статистики
+```bash
+# Проверка состояния пула
+sudo zpool status kafkapool
+
+# Проверка использования места
+sudo zfs list kafkapool
+```
+
+## Дополнительные рекомендации
+
+### 1. Настройка скрипта для мониторинга состояния дисков
+```bash
+sudo apt install -y smartmontools
+sudo smartctl -a /dev/sdb # Повторите для каждого диска в пуле
+```
+
+### 2. Настройка периодического снапшота для резервного копирования
+```bash
+# Создание снапшота
+sudo zfs snapshot kafkapool/kafka_data@backup-$(date +%Y%m%d-%H%M)
+
+# Настройка автоматического снапшота (например, через crontab)
+echo "0 2 * * * root zfs snapshot kafkapool/kafka_data@backup-$(date +\%Y\%m\%d-\%H\%M)" | sudo tee -a /etc/crontab
+```
+
+### 3. Настройка очистки устаревших снапшотов
+```bash
+# Скрипт для удаления старых снапшотов (старше 7 дней)
+cat > /usr/local/bin/clean_zfs_snapshots.sh << 'EOF'
+#!/bin/bash
+zfs list -H -t snapshot -o name,creation | grep kafkapool/kafka_data@backup | 
+while read snap creation; do
+  creation_epoch=$(date -d "$creation" +%s)
+  current_epoch=$(date +%s)
+  age_days=$(( (current_epoch - creation_epoch) / 86400 ))
+  if [ $age_days -gt 7 ]; then
+    zfs destroy $snap
+  fi
+done
+EOF
+
+sudo chmod +x /usr/local/bin/clean_zfs_snapshots.sh
+echo "0 3 * * * root /usr/local/bin/clean_zfs_snapshots.sh" | sudo tee -a /etc/crontab
+```
+
+### 4. Мониторинг производительности ZFS
+```bash
+# Установка инструментов мониторинга
+sudo apt install -y sysstat
+
+# Мониторинг I/O
+iostat -xm 5 zd0 # Показывать статистику каждые 5 секунд
+
+# Мониторинг пула ZFS
+zpool iostat -v kafkapool 5 # Показывать статистику каждые 5 секунд
+```
+
+### 5. Настройка алертов при проблемах с ZFS
+```bash
+# Установка инструментов мониторинга
+sudo apt install -y zfs-zed
+
+# Настройка уведомлений
+sudo vi /etc/zfs/zed.d/zed.rc
+# Раскомментируйте и настройте параметры ZED_EMAIL_ADDR и ZED_EMAIL_PROG
+
+# Перезапуск сервиса ZED
+sudo systemctl restart zfs-zed
+```
